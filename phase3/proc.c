@@ -87,6 +87,10 @@ allocproc(void)
 
 found:
   p->state = EMBRYO;
+  p->priority = 0;
+  p->ticks_used = 0;
+  p->total_ticks = 0;
+  p->wait_ticks = 0;
   p->pid = nextpid++;
 
   release(&ptable.lock);
@@ -325,33 +329,47 @@ scheduler(void)
   struct proc *p;
   struct cpu *c = mycpu();
   c->proc = 0;
-  
+  int q;
+
   for(;;){
     // Enable interrupts on this processor.
     sti();
 
-    // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
+    // MLFQ: scan from highest-priority queue (0) to lowest (NQUEUE-1).
+    struct proc *chosen = 0;
+    for(q = 0; q < NQUEUE && chosen == 0; q++){
+      for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+        if(p->state != RUNNABLE) continue;
+        if(p->priority != q) continue;
+        chosen = p;
+        break;
+      }
+    }
+
+    if(chosen != 0){
+      p = chosen;
+
+      // Other RUNNABLE procs waited a slot.
+      struct proc *q2;
+      for(q2 = ptable.proc; q2 < &ptable.proc[NPROC]; q2++){
+        if(q2 != p && q2->state == RUNNABLE)
+          q2->wait_ticks++;
+      }
+
       c->proc = p;
       switchuvm(p);
       p->state = RUNNING;
+      p->wait_ticks = 0;
 
       swtch(&(c->scheduler), p->context);
       switchkvm();
 
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
       c->proc = 0;
     }
-    release(&ptable.lock);
 
+    release(&ptable.lock);
   }
 }
 
@@ -531,4 +549,44 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+// Called from trap.c on every timer interrupt.
+void
+mlfq_tick(void)
+{
+  struct proc *p;
+  static int boost_counter = 0;
+
+  acquire(&ptable.lock);
+
+  // Charge the currently RUNNING process for this tick.
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state == RUNNING){
+      p->ticks_used++;
+      p->total_ticks++;
+
+      // quantum: queue 0 = 1 tick, queue 1 = 2 ticks, queue 2 = 4 ticks
+      int quantum = 1 << p->priority;
+      if(p->ticks_used >= quantum){
+        if(p->priority < NQUEUE - 1)
+          p->priority++;
+        p->ticks_used = 0;
+      }
+    }
+  }
+
+  // Periodic priority boost: every BOOST_INTERVAL ticks, move everyone to queue 0.
+  boost_counter++;
+  if(boost_counter >= BOOST_INTERVAL){
+    boost_counter = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if(p->state != UNUSED){
+        p->priority = 0;
+        p->ticks_used = 0;
+        p->wait_ticks = 0;
+      }
+    }
+  }
+
+  release(&ptable.lock);
 }

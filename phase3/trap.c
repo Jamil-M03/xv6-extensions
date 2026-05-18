@@ -54,6 +54,7 @@ trap(struct trapframe *tf)
       wakeup(&ticks);
       release(&tickslock);
     }
+    mlfq_tick();
     lapiceoi();
     break;
   case T_IRQ0 + IRQ_IDE:

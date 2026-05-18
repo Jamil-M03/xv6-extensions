@@ -9,9 +9,12 @@ struct cpu {
   int intena;                  // Were interrupts enabled before pushcli?
   struct proc *proc;           // The process running on this cpu or null
 };
-
 extern struct cpu cpus[NCPU];
 extern int ncpu;
+
+// MLFQ scheduler constants
+#define NQUEUE         3       // number of priority queues (0=highest, 2=lowest)
+#define BOOST_INTERVAL 100     // every N ticks, boost all procs to queue 0
 
 //PAGEBREAK: 17
 // Saved registers for kernel context switches.
@@ -49,6 +52,12 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // MLFQ scheduling fields
+  int priority;                // queue level: 0 (highest) .. NQUEUE-1 (lowest)
+  int ticks_used;              // ticks consumed in current quantum
+  int total_ticks;             // lifetime ticks (stats)
+  int wait_ticks;              // ticks since last scheduled
 };
 
 // Process memory is laid out contiguously, low addresses first:
