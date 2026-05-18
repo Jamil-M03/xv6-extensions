@@ -7,6 +7,8 @@
 #include "proc.h"
 #include "vm.h"
 
+int clone(void(*fcn)(void*), void *arg, void *stack);
+
 uint64
 sys_exit(void)
 {
@@ -106,4 +108,15 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_clone(void)
+{
+  void(*fcn)(void*);
+  void *arg, *stack;
+  argaddr(0, (uint64*)&fcn);
+  argaddr(1, (uint64*)&arg);
+  argaddr(2, (uint64*)&stack);
+  return clone(fcn, arg, stack);
 }

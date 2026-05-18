@@ -155,12 +155,13 @@ found:
 static void
 freeproc(struct proc *p)
 {
-  if(p->trapframe)
+  if(p->trapframe && !p->isthread)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pagetable)
+  if(p->pagetable && !p->isthread)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  p->isthread = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -429,11 +430,6 @@ scheduler(void)
 
   c->proc = 0;
   for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
     intr_on();
     intr_off();
 
@@ -441,34 +437,20 @@ scheduler(void)
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
         swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
         c->proc = 0;
         found = 1;
       }
       release(&p->lock);
     }
     if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
   }
 }
 
-// Switch to scheduler.  Must hold only p->lock
-// and have changed proc->state. Saves and restores
-// intena because intena is a property of this
-// kernel thread, not this CPU. It should
-// be proc->intena and proc->noff, but that would
-// break in the few places where a lock is held but
-// there's no process.
 void
 sched(void)
 {
@@ -513,24 +495,17 @@ forkret(void)
   release(&p->lock);
 
   if (first) {
-    // File system initialization must be run in the context of a
-    // regular process (e.g., because it calls sleep), and thus cannot
-    // be run from main().
     fsinit(ROOTDEV);
 
     first = 0;
-    // ensure other cores see first=0.
     __sync_synchronize();
 
-    // We can invoke kexec() now that file system is initialized.
-    // Put the return value (argc) of kexec into a0.
     p->trapframe->a0 = kexec("/init", (char *[]){ "/init", 0 });
     if (p->trapframe->a0 == -1) {
       panic("exec");
     }
   }
 
-  // return to user space, mimicing usertrap()'s return.
   prepare_return();
   uint64 satp = MAKE_SATP(p->pagetable);
   uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
@@ -543,27 +518,17 @@ void
 sleep(void *chan, struct spinlock *lk)
 {
   struct proc *p = myproc();
-  
-  // Must acquire p->lock in order to
-  // change p->state and then call sched.
-  // Once we hold p->lock, we can be
-  // guaranteed that we won't miss any wakeup
-  // (wakeup locks p->lock),
-  // so it's okay to release lk.
 
-  acquire(&p->lock);  //DOC: sleeplock1
+  acquire(&p->lock);
   release(lk);
 
-  // Go to sleep.
   p->chan = chan;
   p->state = SLEEPING;
 
   sched();
 
-  // Tidy up.
   p->chan = 0;
 
-  // Reacquire original lock.
   release(&p->lock);
   acquire(lk);
 }
@@ -587,8 +552,6 @@ wakeup(void *chan)
 }
 
 // Kill the process with the given pid.
-// The victim won't exit until it tries to return
-// to user space (see usertrap() in trap.c).
 int
 kkill(int pid)
 {
@@ -599,7 +562,6 @@ kkill(int pid)
     if(p->pid == pid){
       p->killed = 1;
       if(p->state == SLEEPING){
-        // Wake process from sleep().
         p->state = RUNNABLE;
       }
       release(&p->lock);
@@ -631,7 +593,6 @@ killed(struct proc *p)
 
 // Copy to either a user address, or kernel address,
 // depending on usr_dst.
-// Returns 0 on success, -1 on error.
 int
 either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
 {
@@ -646,7 +607,6 @@ either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
 
 // Copy from either a user address, or kernel address,
 // depending on usr_src.
-// Returns 0 on success, -1 on error.
 int
 either_copyin(void *dst, int user_src, uint64 src, uint64 len)
 {
@@ -659,9 +619,57 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
   }
 }
 
+int clone(void(*fcn)(void*), void *arg, void *stack) {
+    int pid;
+    struct proc *np;
+    struct proc *p = myproc();
+
+    if((np = allocproc()) == 0)
+        return -1;
+
+    // Share parent's page table (same address space)
+    np->pagetable = p->pagetable;
+    np->sz = p->sz;
+    np->isthread = 1;
+
+    // Copy trapframe
+    *(np->trapframe) = *(p->trapframe);
+
+    // Stack top (user virtual address), aligned to 16 bytes
+    uint64 sp = (uint64)stack + PGSIZE;
+    sp = sp - (sp % 16);
+
+    // Push fake return address (0) via copyout
+    uint64 zero = 0;
+    sp -= 8;
+    copyout(np->pagetable, sp, (char*)&zero, 8);
+
+    // Set registers
+    np->trapframe->sp  = sp;
+    np->trapframe->epc = (uint64)fcn;
+    np->trapframe->a0  = (uint64)arg;
+
+    // Copy file descriptors
+    for(int i = 0; i < NOFILE; i++)
+        if(p->ofile[i])
+            np->ofile[i] = filedup(p->ofile[i]);
+    np->cwd = idup(p->cwd);
+
+    safestrcpy(np->name, p->name, sizeof(p->name));
+    pid = np->pid;
+
+    acquire(&wait_lock);
+    np->parent = p;
+    release(&wait_lock);
+
+    np->state = RUNNABLE;
+    release(&np->lock);
+
+    return pid;
+}
+
 // Print a process listing to console.  For debugging.
 // Runs when user types ^P on console.
-// No lock to avoid wedging a stuck machine further.
 void
 procdump(void)
 {

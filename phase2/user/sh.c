@@ -4,6 +4,20 @@
 #include "user/user.h"
 #include "kernel/fcntl.h"
 
+#define HIST_SIZE 20
+char history[HIST_SIZE][100];
+int hist_count = 0;
+
+void add_history(char *cmd) {
+    if (hist_count < HIST_SIZE) {
+        strcpy(history[hist_count++], cmd);
+    } else {
+        for (int i = 0; i < HIST_SIZE - 1; i++)
+            strcpy(history[i], history[i + 1]);
+        strcpy(history[HIST_SIZE - 1], cmd);
+    }
+}
+
 // Parsed command representation
 #define EXEC  1
 #define REDIR 2
@@ -131,13 +145,54 @@ runcmd(struct cmd *cmd)
   exit(0);
 }
 
-int
-getcmd(char *buf, int nbuf)
+int getcmd(char *buf, int nbuf)
 {
-  write(2, "$ ", 2);
+  fprintf(2, "$ ");
   memset(buf, 0, nbuf);
-  gets(buf, nbuf);
-  if(buf[0] == 0) // EOF
+
+  int i = 0;
+  int hist_idx = hist_count;
+  char c;
+
+  while(read(0, &c, 1) == 1){
+    if(c == '\n'){
+      buf[i] = '\0';
+      fprintf(2, "\n");
+      break;
+    } else if(c == 16){ // Ctrl-P = prev cmd
+      if(hist_idx > 0){
+        hist_idx--;
+        memset(buf, 0, nbuf);
+        strcpy(buf, history[hist_idx]);
+        i = strlen(buf);
+        fprintf(2, "\r$ %s", buf);
+      }
+    } else if(c == 14){ // Ctrl-N = next cmd
+      if(hist_idx < hist_count - 1){
+        hist_idx++;
+        memset(buf, 0, nbuf);
+        strcpy(buf, history[hist_idx]);
+        i = strlen(buf);
+        fprintf(2, "\r$ %s", buf);
+      }
+    } else if(c == 127 || c == '\b'){
+      if(i > 0){
+        i--;
+        buf[i] = '\0';
+        fprintf(2, "\b \b");
+      }
+    } else {
+      if(i < nbuf-1){
+        buf[i++] = c;
+        fprintf(2, "%c", c);
+      }
+    }
+  }
+
+  if(buf[0] != '\0')
+    add_history(buf);
+
+  if(buf[0] == 0)
     return -1;
   return 0;
 }
@@ -161,13 +216,15 @@ main(void)
     char *cmd = buf;
     while (*cmd == ' ' || *cmd == '\t')
       cmd++;
-    if (*cmd == '\n') // is a blank command
+    if (*cmd == '\n')
       continue;
     if(cmd[0] == 'c' && cmd[1] == 'd' && cmd[2] == ' '){
-      // Chdir must be called by the parent, not the child.
-      cmd[strlen(cmd)-1] = 0;  // chop \n
+      cmd[strlen(cmd)-1] = 0;
       if(chdir(cmd+3) < 0)
         fprintf(2, "cannot cd %s\n", cmd+3);
+    } else if(strcmp(cmd, "history") == 0){
+      for(int h = 0; h < hist_count; h++)
+        printf("%d  %s\n", h+1, history[h]);
     } else {
       if(fork1() == 0)
         runcmd(parsecmd(cmd));
@@ -262,6 +319,7 @@ backcmd(struct cmd *subcmd)
   cmd->cmd = subcmd;
   return (struct cmd*)cmd;
 }
+
 //PAGEBREAK!
 // Parsing
 
